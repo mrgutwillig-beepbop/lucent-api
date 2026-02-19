@@ -1,0 +1,32 @@
+{
+     "name": "lucent-api",
+     "version": "1.0.0",
+     "description": "Lucent Partners Enforcement API",
+     "main": "index.js",
+     "scripts": {
+       "start": "node index.js"
+     },
+     "dependencies": {
+       "express": "^4.18.2",
+       "@supabase/supabase-js": "^2.39.0",
+       "dotenv": "^16.3.1",
+       "cors": "^2.8.5"
+     }
+   }
+```
+   - Click **"Commit changes"**
+
+3. **Second file - index.js:**
+   - Click **"Add file"** → **"Create new file"** again
+   - Filename: `index.js`
+   - Copy the ENTIRE contents of the `lucent_api.js` file I gave you
+   - BUT **remove the first 60 lines** (the comments about package.json and .env) - start from `require('dotenv').config();`
+   - Click **"Commit changes"**
+
+4. **Third file - .gitignore:**
+   - Should already be there if you selected "Node" template
+   - If not, create it with:
+```
+   node_modules/
+   .env
+   *.log
