@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -9,8 +10,17 @@ const PORT = process.env.PORT || 3000;
 // Initialize Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY // Use service key for admin access
+  process.env.SUPABASE_SERVICE_KEY
 );
+
+// Configure email transporter
+const emailTransporter = nodemailer.createTransport({
+  service: 'gmail',
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD
+  }
+});
 
 // Middleware
 app.use(cors());
@@ -38,7 +48,6 @@ app.get('/health', (req, res) => {
 
 // =====================================================
 // POST /api/leads/intake
-// Receives webhook from CRM, creates lead in Supabase
 // =====================================================
 
 app.post('/api/leads/intake', authenticateRequest, async (req, res) => {
@@ -54,7 +63,6 @@ app.post('/api/leads/intake', authenticateRequest, async (req, res) => {
       crm_contact_id 
     } = req.body;
     
-    // Validate required fields
     if (!org_id) {
       return res.status(400).json({ error: 'org_id is required' });
     }
@@ -63,7 +71,6 @@ app.post('/api/leads/intake', authenticateRequest, async (req, res) => {
       return res.status(400).json({ error: 'Either email or phone is required' });
     }
     
-    // Create lead in Supabase
     const { data: lead, error } = await supabase
       .from('leads')
       .insert({
@@ -86,7 +93,6 @@ app.post('/api/leads/intake', authenticateRequest, async (req, res) => {
       return res.status(500).json({ error: 'Failed to create lead', details: error.message });
     }
     
-    // Log event
     await supabase.from('lead_events').insert({
       lead_id: lead.id,
       org_id: lead.org_id,
@@ -108,14 +114,12 @@ app.post('/api/leads/intake', authenticateRequest, async (req, res) => {
 
 // =====================================================
 // POST /api/leads/:id/assign
-// Assigns a lead to next available agent
 // =====================================================
 
 app.post('/api/leads/:id/assign', authenticateRequest, async (req, res) => {
   try {
     const { id: leadId } = req.params;
     
-    // Call PostgreSQL function to assign lead
     const { data, error } = await supabase
       .rpc('assign_lead_to_next_agent', { p_lead_id: leadId });
     
@@ -149,14 +153,12 @@ app.post('/api/leads/:id/assign', authenticateRequest, async (req, res) => {
 
 // =====================================================
 // POST /api/leads/:id/contacted
-// Marks a lead as contacted by agent
 // =====================================================
 
 app.post('/api/leads/:id/contacted', authenticateRequest, async (req, res) => {
   try {
     const { id: leadId } = req.params;
     
-    // Call PostgreSQL function
     const { data, error } = await supabase
       .rpc('mark_lead_contacted', { p_lead_id: leadId });
     
@@ -180,14 +182,12 @@ app.post('/api/leads/:id/contacted', authenticateRequest, async (req, res) => {
 
 // =====================================================
 // GET /api/organizations/:org_id/overdue-leads
-// Gets all leads past their SLA deadline for monitoring
 // =====================================================
 
 app.get('/api/organizations/:org_id/overdue-leads', authenticateRequest, async (req, res) => {
   try {
     const { org_id } = req.params;
     
-    // Call PostgreSQL function
     const { data, error } = await supabase
       .rpc('get_overdue_leads', { p_org_id: org_id });
     
@@ -211,16 +211,15 @@ app.get('/api/organizations/:org_id/overdue-leads', authenticateRequest, async (
 
 // =====================================================
 // POST /api/leads/:id/escalate
-// Escalates a lead that's overdue
 // =====================================================
 
 app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
   try {
     const { id: leadId } = req.params;
-    const { tier = 1 } = req.body;
+    const { tier = 1, send_email = true } = req.body;
     
-    // Call PostgreSQL function
-    const { data, error } = await supabase
+    // Escalate in database
+    const { data: escalationId, error } = await supabase
       .rpc('escalate_lead', { 
         p_lead_id: leadId,
         p_tier: tier
@@ -231,12 +230,87 @@ app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
       return res.status(500).json({ error: 'Failed to escalate lead', details: error.message });
     }
     
+    // Get lead and org details for email
+    const { data: leadData } = await supabase
+      .from('leads')
+      .select(`
+        *,
+        agents (name, phone),
+        organizations (name, primary_contact_email)
+      `)
+      .eq('id', leadId)
+      .single();
+    
+    // Send email notification if requested
+    if (send_email && leadData && leadData.organizations.primary_contact_email) {
+      try {
+        const minutesOverdue = Math.floor((new Date() - new Date(leadData.sla_deadline)) / 60000);
+        
+        await emailTransporter.sendMail({
+          from: `"Lucent Enforcement Alert" <${process.env.GMAIL_USER}>`,
+          to: leadData.organizations.primary_contact_email,
+          subject: `⚠️ SLA BREACH - ${leadData.first_name} ${leadData.last_name}`,
+          html: `
+            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
+              <h2 style="color: #dc2626; margin-bottom: 20px;">⚠️ SLA Breach Alert</h2>
+              
+              <div style="background: #fef2f2; border-left: 4px solid #dc2626; padding: 16px; margin-bottom: 20px;">
+                <p style="margin: 0; font-weight: 600; color: #991b1b;">
+                  Lead has exceeded response window by ${minutesOverdue} minutes
+                </p>
+              </div>
+              
+              <h3 style="color: #1e293b; margin-bottom: 12px;">Lead Details:</h3>
+              <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="padding: 8px 0; font-weight: 600;">Name:</td>
+                  <td style="padding: 8px 0;">${leadData.first_name} ${leadData.last_name}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="padding: 8px 0; font-weight: 600;">Phone:</td>
+                  <td style="padding: 8px 0;">${leadData.phone || 'N/A'}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="padding: 8px 0; font-weight: 600;">Email:</td>
+                  <td style="padding: 8px 0;">${leadData.email || 'N/A'}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="padding: 8px 0; font-weight: 600;">Assigned Agent:</td>
+                  <td style="padding: 8px 0;">${leadData.agents?.name || 'Unassigned'}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="padding: 8px 0; font-weight: 600;">Temperature:</td>
+                  <td style="padding: 8px 0; text-transform: uppercase; color: ${leadData.lead_temperature === 'hot' ? '#dc2626' : '#d97706'};">
+                    ${leadData.lead_temperature}
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding: 8px 0; font-weight: 600;">Source:</td>
+                  <td style="padding: 8px 0;">${leadData.source}</td>
+                </tr>
+              </table>
+              
+              <p style="color: #64748b; font-size: 14px; margin-top: 30px; padding-top: 20px; border-top: 1px solid #e2e8f0;">
+                This is an automated alert from Lucent Partners enforcement system.
+              </p>
+            </div>
+          `
+        });
+        
+        console.log('Escalation email sent for lead:', leadId);
+      } catch (emailError) {
+        console.error('Email send error:', emailError);
+        // Don't fail the entire escalation if email fails
+      }
+    }
+    
     res.json({
       success: true,
       lead_id: leadId,
-      escalation_id: data,
+      escalation_id: escalationId,
       tier,
-      escalated_at: new Date().toISOString()
+      escalated_at: new Date().toISOString(),
+      email_sent: send_email
     });
     
   } catch (error) {
@@ -247,14 +321,12 @@ app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
 
 // =====================================================
 // GET /api/organizations/:org_id/stats
-// Get basic stats for a client
 // =====================================================
 
 app.get('/api/organizations/:org_id/stats', authenticateRequest, async (req, res) => {
   try {
     const { org_id } = req.params;
     
-    // Get lead counts by status
     const { data: leads, error: leadsError } = await supabase
       .from('leads')
       .select('status')
@@ -262,7 +334,6 @@ app.get('/api/organizations/:org_id/stats', authenticateRequest, async (req, res
     
     if (leadsError) throw leadsError;
     
-    // Calculate stats
     const stats = {
       total_leads: leads.length,
       by_status: {
@@ -274,7 +345,6 @@ app.get('/api/organizations/:org_id/stats', authenticateRequest, async (req, res
       }
     };
     
-    // Get average response time for contacted leads (last 30 days)
     const { data: recentLeads, error: responseError } = await supabase
       .from('leads')
       .select('response_time_seconds')
@@ -307,54 +377,5 @@ app.get('/api/organizations/:org_id/stats', authenticateRequest, async (req, res
 app.listen(PORT, () => {
   console.log(`✅ Lucent API running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`📧 Email notifications: ${process.env.GMAIL_USER ? 'Configured' : 'NOT configured'}`);
 });
-
-// =====================================================
-// EXAMPLE REQUESTS (for testing with curl)
-// =====================================================
-
-/*
-
-1. CREATE A LEAD (webhook simulation):
-
-curl -X POST http://localhost:3000/api/leads/intake \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-secret-key" \
-  -d '{
-    "org_id": "00000000-0000-0000-0000-000000000001",
-    "first_name": "John",
-    "last_name": "Doe",
-    "phone": "+15559876543",
-    "email": "john@example.com",
-    "source": "followupboss",
-    "lead_temperature": "hot"
-  }'
-
-2. ASSIGN THE LEAD:
-
-curl -X POST http://localhost:3000/api/leads/{LEAD_ID}/assign \
-  -H "X-API-Key: your-secret-key"
-
-3. MARK AS CONTACTED:
-
-curl -X POST http://localhost:3000/api/leads/{LEAD_ID}/contacted \
-  -H "X-API-Key: your-secret-key"
-
-4. GET OVERDUE LEADS:
-
-curl http://localhost:3000/api/organizations/00000000-0000-0000-0000-000000000001/overdue-leads \
-  -H "X-API-Key: your-secret-key"
-
-5. ESCALATE A LEAD:
-
-curl -X POST http://localhost:3000/api/leads/{LEAD_ID}/escalate \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-secret-key" \
-  -d '{"tier": 1}'
-
-6. GET ORG STATS:
-
-curl http://localhost:3000/api/organizations/00000000-0000-0000-0000-000000000001/stats \
-  -H "X-API-Key: your-secret-key"
-
-*/
