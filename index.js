@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const nodemailer = require('nodemailer');
+const sgMail = require('@sendgrid/mail');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,14 +13,8 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-// Configure email transporter
-const emailTransporter = nodemailer.createTransport({
-  service: 'gmail',
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD
-  }
-});
+// Configure SendGrid
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 // Middleware
 app.use(cors());
@@ -43,7 +37,11 @@ const authenticateRequest = (req, res, next) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    email_provider: 'SendGrid'
+  });
 });
 
 // =====================================================
@@ -246,9 +244,9 @@ app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
       try {
         const minutesOverdue = Math.floor((new Date() - new Date(leadData.sla_deadline)) / 60000);
         
-        await emailTransporter.sendMail({
-          from: `"Lucent Enforcement Alert" <${process.env.GMAIL_USER}>`,
+        const msg = {
           to: leadData.organizations.primary_contact_email,
+          from: 'alerts@lucent-partners.com', // Will show via sendgrid.net until domain is verified
           subject: `⚠️ SLA BREACH - ${leadData.first_name} ${leadData.last_name}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
@@ -295,11 +293,15 @@ app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
               </p>
             </div>
           `
-        });
+        };
         
-        console.log('Escalation email sent for lead:', leadId);
+        await sgMail.send(msg);
+        console.log('Escalation email sent via SendGrid for lead:', leadId);
       } catch (emailError) {
-        console.error('Email send error:', emailError);
+        console.error('SendGrid email error:', emailError);
+        if (emailError.response) {
+          console.error('SendGrid response:', emailError.response.body);
+        }
         // Don't fail the entire escalation if email fails
       }
     }
@@ -377,5 +379,5 @@ app.get('/api/organizations/:org_id/stats', authenticateRequest, async (req, res
 app.listen(PORT, () => {
   console.log(`✅ Lucent API running on port ${PORT}`);
   console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`📧 Email notifications: ${process.env.GMAIL_USER ? 'Configured' : 'NOT configured'}`);
+  console.log(`📧 Email provider: SendGrid`);
 });
