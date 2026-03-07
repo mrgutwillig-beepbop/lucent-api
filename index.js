@@ -246,7 +246,7 @@ app.post('/api/leads/:id/escalate', authenticateRequest, async (req, res) => {
         
         const msg = {
           to: leadData.organizations.primary_contact_email,
-          from: 'alerts@lucent-partners.com', // Will show via sendgrid.net until domain is verified
+          from: 'michael.gutwillig@lucent-partners.com', // Will show via sendgrid.net until domain is verified
           subject: `⚠️ SLA BREACH - ${leadData.first_name} ${leadData.last_name}`,
           html: `
             <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
