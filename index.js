@@ -449,6 +449,23 @@ if (require.main === module) {
     console.log(`📧 Email provider: SendGrid`);
     console.log(`📱 SMS provider: ${twilioClient ? 'Twilio' : 'disabled'}`);
   });
+
+  // Enforcement worker: agent texts, manager escalation, reassignment.
+  // Disable with ENFORCEMENT_ENABLED=false.
+  if (process.env.ENFORCEMENT_ENABLED !== 'false') {
+    const { createEnforcementWorker, createSupabaseStore, createNotifier } = require('./enforcement');
+    const worker = createEnforcementWorker({
+      store: createSupabaseStore(supabase),
+      notifier: createNotifier({
+        twilioClient,
+        fromNumber: process.env.TWILIO_PHONE_NUMBER,
+        sgMail,
+        fromEmail: process.env.ALERT_FROM_EMAIL || 'michael.gutwillig@lucent-partners.com',
+      }),
+    });
+    worker.start(Number(process.env.ENFORCEMENT_INTERVAL_MS) || 30000);
+    console.log('🛡️  Enforcement worker running');
+  }
 }
 
 module.exports = { createApp };
