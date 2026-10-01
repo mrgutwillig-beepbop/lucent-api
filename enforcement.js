@@ -10,10 +10,10 @@
 //                  the lead to the next available agent and tell both agents
 //
 // All I/O goes through an injected `store` and `notifier`, so the logic can be
-// tested without Supabase, Twilio or SendGrid.
+// tested without Supabase, Twilio or Resend.
 // =====================================================
 
-const { isValidPhone, normalizePhone } = require('./sms');
+const { isValidPhone, normalizePhone, testPrefix, isTestOrg } = require('./sms');
 
 // Leads older than this are ignored, so old/test data is never acted on.
 const LOOKBACK_HOURS = 24;
@@ -39,7 +39,7 @@ function agentAssignmentMessage(lead) {
   ];
   if (lead.source) lines.push(`Source: ${lead.source}`);
   if (mins) lines.push(`Please respond within ${mins} min.`);
-  return lines.join('\n');
+  return testPrefix(lead.organizations?.name) + lines.join('\n');
 }
 
 function managerEscalationMessage(lead) {
@@ -51,11 +51,11 @@ function managerEscalationMessage(lead) {
   if (canReassign && reassignMins) {
     msg += ` It will be reassigned in ${reassignMins} min if still not contacted.`;
   }
-  return msg;
+  return testPrefix(lead.organizations?.name) + msg;
 }
 
 function previousAgentMessage(lead) {
-  return `LUCENT: ${leadName(lead)} has been reassigned to another agent because no response was recorded.`;
+  return `${testPrefix(lead.organizations?.name)}LUCENT: ${leadName(lead)} has been reassigned to another agent because no response was recorded.`;
 }
 
 // ---------- worker ----------
@@ -235,7 +235,7 @@ function escalationEmailHtml(lead) {
   </div>`;
 }
 
-function createNotifier({ twilioClient, fromNumber, sgMail, fromEmail }) {
+function createNotifier({ twilioClient, fromNumber, mailer, fromEmail }) {
   return {
     async sms(to, body) {
       if (!twilioClient || !fromNumber) return { sent: false, reason: 'twilio_not_configured' };
@@ -243,11 +243,12 @@ function createNotifier({ twilioClient, fromNumber, sgMail, fromEmail }) {
       return { sent: true, sid: m.sid };
     },
     async email(to, lead) {
-      if (!sgMail || !fromEmail) return;
-      await sgMail.send({
+      if (!mailer || !fromEmail) return;
+      const test = isTestOrg(lead.organizations?.name) ? '[TEST] ' : '';
+      await mailer.send({
         to,
         from: fromEmail,
-        subject: `Lead not contacted: ${leadName(lead)}`,
+        subject: `${test}Lead not contacted: ${leadName(lead)}`,
         html: escalationEmailHtml(lead),
       });
     },

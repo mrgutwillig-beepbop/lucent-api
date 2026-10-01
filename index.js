@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
-const sgMail = require('@sendgrid/mail');
+const { createMailer, resolveResendKey } = require('./mailer');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -12,7 +12,7 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null } = {}) {
   const app = express();
 
   // Middleware
@@ -39,7 +39,7 @@ function createApp({ supabase, twilioClient = null, twilioFromNumber = null } = 
     res.json({
       status: 'ok',
       timestamp: new Date().toISOString(),
-      email_provider: 'SendGrid',
+      email_provider: 'Resend',
       sms_provider: twilioClient ? 'Twilio' : 'disabled'
     });
   });
@@ -279,13 +279,13 @@ function createApp({ supabase, twilioClient = null, twilioFromNumber = null } = 
         .single();
 
       // Send email notification if requested
-      if (send_email && leadData && leadData.organizations.primary_contact_email) {
+      if (send_email && mailer && leadData && leadData.organizations.primary_contact_email) {
         try {
           const minutesOverdue = Math.floor((new Date() - new Date(leadData.sla_deadline)) / 60000);
 
           const msg = {
             to: leadData.organizations.primary_contact_email,
-            from: 'michael.gutwillig@lucent-partners.com', // Will show via sendgrid.net until domain is verified
+            from: fromEmail,
             subject: `⚠️ SLA BREACH - ${leadData.first_name} ${leadData.last_name}`,
             html: `
               <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px;">
@@ -334,13 +334,10 @@ function createApp({ supabase, twilioClient = null, twilioFromNumber = null } = 
             `
           };
 
-          await sgMail.send(msg);
-          console.log('Escalation email sent via SendGrid for lead:', leadId);
+          await mailer.send(msg);
+          console.log('Escalation email sent for lead:', leadId);
         } catch (emailError) {
-          console.error('SendGrid email error:', emailError);
-          if (emailError.response) {
-            console.error('SendGrid response:', emailError.response.body);
-          }
+          console.error('Email error:', emailError.message);
           // Don't fail the entire escalation if email fails
         }
       }
@@ -425,8 +422,11 @@ if (require.main === module) {
     process.env.SUPABASE_SERVICE_KEY
   );
 
-  // Configure SendGrid
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  // Configure email (Resend). ALERT_FROM_EMAIL must be on a domain verified
+  // in Resend; onboarding@resend.dev works for testing to the account owner only.
+  const mailer = createMailer({ apiKey: resolveResendKey() });
+  const fromEmail = process.env.ALERT_FROM_EMAIL || 'Lucent Alerts <onboarding@resend.dev>';
+  if (!mailer) console.warn('⚠️  Email not configured (RESEND_API_KEY missing) — alert emails disabled');
 
   // Configure Twilio (guarded so the API still boots without SMS creds)
   let twilioClient = null;
@@ -439,14 +439,16 @@ if (require.main === module) {
   const app = createApp({
     supabase,
     twilioClient,
-    twilioFromNumber: process.env.TWILIO_PHONE_NUMBER
+    twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
+    mailer,
+    fromEmail
   });
 
   const PORT = process.env.PORT || 3000;
   app.listen(PORT, () => {
     console.log(`✅ Lucent API running on port ${PORT}`);
     console.log(`📊 Health check: http://localhost:${PORT}/health`);
-    console.log(`📧 Email provider: SendGrid`);
+    console.log(`📧 Email provider: ${mailer ? 'Resend' : 'disabled'}`);
     console.log(`📱 SMS provider: ${twilioClient ? 'Twilio' : 'disabled'}`);
   });
 
@@ -459,8 +461,8 @@ if (require.main === module) {
       notifier: createNotifier({
         twilioClient,
         fromNumber: process.env.TWILIO_PHONE_NUMBER,
-        sgMail,
-        fromEmail: process.env.ALERT_FROM_EMAIL || 'michael.gutwillig@lucent-partners.com',
+        mailer,
+        fromEmail,
       }),
     });
     worker.start(Number(process.env.ENFORCEMENT_INTERVAL_MS) || 30000);

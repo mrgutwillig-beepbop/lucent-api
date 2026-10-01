@@ -131,3 +131,10 @@ test('message wording', () => {
     /reassigned in/
   );
 });
+
+test('texts and email subject are marked [TEST] for test organizations', async () => {
+  const testOrg = { ...lead().organizations, name: 'Lucent Test Team' };
+  assert.match(agentAssignmentMessage(lead({ organizations: testOrg })), /^\[TEST\] LUCENT:/);
+  assert.match(managerEscalationMessage(lead({ organizations: testOrg })), /^\[TEST\] LUCENT ALERT:/);
+  assert.doesNotMatch(agentAssignmentMessage(lead()), /TEST/);
+});

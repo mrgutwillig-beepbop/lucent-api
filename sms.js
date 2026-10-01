@@ -33,7 +33,17 @@ function normalizePhone(phone) {
 // if the org name is missing so we never send "... from undefined ...".
 function formatIntakeMessage(orgName) {
   const name = orgName && String(orgName).trim() ? String(orgName).trim() : 'our team';
-  return `Thanks for your inquiry. An agent from ${name} will contact you shortly.`;
+  return `${testPrefix(orgName)}Thanks for your inquiry. An agent from ${name} will contact you shortly.`;
+}
+
+// Organizations with "test" in their name are test teams: every text sent
+// for them starts with "[TEST] " so recipients never mistake it for a real lead.
+function isTestOrg(orgName) {
+  return /\btest\b/i.test(String(orgName || ''));
+}
+
+function testPrefix(orgName) {
+  return isTestOrg(orgName) ? '[TEST] ' : '';
 }
 
 // Send the intake SMS. Best-effort by contract: returns a result object and
@@ -59,6 +69,8 @@ async function sendIntakeSms({ twilioClient, fromNumber, phone, orgName }) {
 }
 
 module.exports = {
+  isTestOrg,
+  testPrefix,
   isValidPhone,
   normalizePhone,
   formatIntakeMessage,
