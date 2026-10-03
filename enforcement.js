@@ -31,7 +31,7 @@ function windowMinutes(lead) {
 
 // ---------- message builders ----------
 
-function agentAssignmentMessage(lead) {
+function agentAssignmentMessage(lead, callUrl) {
   const mins = windowMinutes(lead);
   const lines = [
     `LUCENT: ${lead.reassign_count > 0 ? 'Lead reassigned to you' : 'New lead assigned to you'}.`,
@@ -39,6 +39,7 @@ function agentAssignmentMessage(lead) {
   ];
   if (lead.source) lines.push(`Source: ${lead.source}`);
   if (mins) lines.push(`Please respond within ${mins} min.`);
+  if (callUrl && lead.phone) lines.push(`Tap to call: ${callUrl}`);
   return testPrefix(lead.organizations?.name) + lines.join('\n');
 }
 
@@ -60,7 +61,7 @@ function previousAgentMessage(lead) {
 
 // ---------- worker ----------
 
-function createEnforcementWorker({ store, notifier, now = () => new Date(), log = console }) {
+function createEnforcementWorker({ store, notifier, callLinkFor = null, now = () => new Date(), log = console }) {
   const since = () => new Date(now().getTime() - LOOKBACK_HOURS * 3600 * 1000).toISOString();
 
   async function sms(to, body) {
@@ -81,7 +82,9 @@ function createEnforcementWorker({ store, notifier, now = () => new Date(), log 
       // Claim first so a lead is never texted twice.
       const claimed = await store.claimNotification(lead.id);
       if (!claimed) continue;
-      const r = await sms(lead.agents?.phone, agentAssignmentMessage(lead));
+      let callUrl = null;
+      try { callUrl = callLinkFor ? callLinkFor(lead) : null; } catch (e) { log.error('Call link error:', e.message); }
+      const r = await sms(lead.agents?.phone, agentAssignmentMessage(lead, callUrl));
       if (r.sent) count++;
     }
     return count;
@@ -170,7 +173,7 @@ function createEnforcementWorker({ store, notifier, now = () => new Date(), log 
 
 const LEAD_FIELDS = `
   id, first_name, last_name, email, phone, source, lead_temperature, status,
-  assigned_at, sla_deadline, first_contact_at, escalation_count,
+  assigned_to, assigned_at, sla_deadline, first_contact_at, escalation_count,
   last_escalation_at, reassign_count,
   agents ( name, phone ),
   organizations ( name, primary_contact_name, primary_contact_email,

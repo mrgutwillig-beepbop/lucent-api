@@ -3,6 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { createMailer, resolveResendKey } = require('./mailer');
+const { createCallBridge, createCallStore, makeCallCode } = require('./callbridge');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -12,8 +13,12 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null } = {}) {
   const app = express();
+
+  // Tap-to-call pages and Twilio voice webhooks (no API key; secured by
+  // signed links and Twilio request signatures).
+  if (callBridge) app.use(callBridge);
 
   // Middleware
   app.use(cors());
@@ -436,12 +441,32 @@ if (require.main === module) {
     console.warn('⚠️  Twilio not configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing) — intake SMS disabled');
   }
 
+  // Tap-to-call. Links are signed with CALL_LINK_SECRET (falls back to API_SECRET_KEY).
+  const publicBaseUrl = process.env.PUBLIC_BASE_URL || 'https://lucent-api-production.up.railway.app';
+  const callSecret = process.env.CALL_LINK_SECRET || process.env.API_SECRET_KEY;
+  const callBridge = callSecret && process.env.TAP_TO_CALL_ENABLED !== 'false'
+    ? createCallBridge({
+        store: createCallStore(supabase),
+        twilioClient,
+        fromNumber: process.env.TWILIO_PHONE_NUMBER,
+        baseUrl: publicBaseUrl,
+        secret: callSecret,
+        validateTwilio: process.env.TWILIO_AUTH_TOKEN
+          ? (sig, url, params) => twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, sig, url, params)
+          : null,
+      })
+    : null;
+  const callLinkFor = callBridge
+    ? (lead) => (lead.assigned_to ? `${publicBaseUrl}/c/${makeCallCode(callSecret, lead.id, lead.assigned_to)}` : null)
+    : null;
+
   const app = createApp({
     supabase,
     twilioClient,
     twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
     mailer,
-    fromEmail
+    fromEmail,
+    callBridge
   });
 
   const PORT = process.env.PORT || 3000;
@@ -450,6 +475,7 @@ if (require.main === module) {
     console.log(`📊 Health check: http://localhost:${PORT}/health`);
     console.log(`📧 Email provider: ${mailer ? 'Resend' : 'disabled'}`);
     console.log(`📱 SMS provider: ${twilioClient ? 'Twilio' : 'disabled'}`);
+    console.log(`📞 Tap-to-call: ${callBridge ? 'enabled' : 'disabled'}`);
   });
 
   // Enforcement worker: agent texts, manager escalation, reassignment.
@@ -458,6 +484,7 @@ if (require.main === module) {
     const { createEnforcementWorker, createSupabaseStore, createNotifier } = require('./enforcement');
     const worker = createEnforcementWorker({
       store: createSupabaseStore(supabase),
+      callLinkFor,
       notifier: createNotifier({
         twilioClient,
         fromNumber: process.env.TWILIO_PHONE_NUMBER,
