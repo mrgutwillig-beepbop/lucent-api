@@ -399,15 +399,21 @@ function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mai
 
       const { data: recentLeads, error: responseError } = await supabase
         .from('leads')
-        .select('response_time_seconds')
+        .select('response_time_seconds, time_to_first_contact_seconds')
         .eq('org_id', org_id)
         .eq('status', 'contacted')
         .gte('created_at', new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString())
         .not('response_time_seconds', 'is', null);
 
       if (!responseError && recentLeads.length > 0) {
-        const avgSeconds = recentLeads.reduce((sum, l) => sum + l.response_time_seconds, 0) / recentLeads.length;
-        stats.avg_response_time_minutes = Math.round(avgSeconds / 60);
+        const avg = (key) => {
+          const vals = recentLeads.map((l) => l[key]).filter((v) => typeof v === 'number');
+          return vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length / 60) : null;
+        };
+        // Agent's time from their (latest) assignment.
+        stats.avg_response_time_minutes = avg('response_time_seconds');
+        // Total time the lead waited, from when it arrived.
+        stats.avg_time_to_first_contact_minutes = avg('time_to_first_contact_seconds');
       }
 
       res.json({
