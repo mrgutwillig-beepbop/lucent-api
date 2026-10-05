@@ -61,6 +61,58 @@ function contactPoints(person) {
   return { phones, emails };
 }
 
+// ---------- email helpers ----------
+// FUB emails have no personId / isIncoming. The contact comes from
+// relatedPeople, and direction from the addresses (from / to / cc / bcc).
+
+function relatedPersonIds(email) {
+  const list = Array.isArray(email?.relatedPeople) ? email.relatedPeople : [];
+  return [...new Set(list.map((p) => (typeof p === 'object' && p ? (p.id ?? p.personId) : p)).filter(Boolean))];
+}
+
+// Pulls email addresses out of a value that may be a string, an object
+// ({email}, {address}, {value}) or an array of those.
+function collectEmails(v) {
+  if (!v) return [];
+  if (typeof v === 'string') return (v.match(/[^\s<>,;"]+@[^\s<>,;"]+/g) || []).map(normEmail);
+  if (Array.isArray(v)) return v.flatMap(collectEmails);
+  if (typeof v === 'object') return collectEmails(v.email ?? v.address ?? v.value ?? '');
+  return [];
+}
+
+// Splits FUB 'addresses' into senders and recipients. Handles an object keyed
+// by role ({from, to, cc, bcc}) or a list of {type/role, email} entries.
+function emailRoles(addresses) {
+  const from = [];
+  const to = [];
+  if (Array.isArray(addresses)) {
+    for (const a of addresses) {
+      const role = String(a?.type ?? a?.role ?? a?.kind ?? '').toLowerCase();
+      (role === 'from' || role === 'sender' ? from : to).push(...collectEmails(a));
+    }
+  } else if (addresses && typeof addresses === 'object') {
+    for (const [key, val] of Object.entries(addresses)) {
+      const role = key.toLowerCase();
+      if (role === 'from' || role === 'sender' || role === 'replyto') from.push(...collectEmails(val));
+      else to.push(...collectEmails(val));
+    }
+  }
+  return { from, to };
+}
+
+function emailSentTo(email, contactEmails) {
+  const { from, to } = emailRoles(email?.addresses);
+  if (contactEmails.some((e) => from.includes(e))) return false; // the lead wrote in
+  return contactEmails.some((e) => to.includes(e));
+}
+
+// Structure only (types and keys), never values: safe to log.
+function describeShape(email) {
+  const shape = (v) => (Array.isArray(v) ? `array(${v.length})[${v.length ? shape(v[0]) : ''}]`
+    : v && typeof v === 'object' ? `{${Object.keys(v).join(',')}}` : typeof v);
+  return `addresses=${shape(email?.addresses)} relatedPeople=${shape(email?.relatedPeople)}`;
+}
+
 // ---------- FUB API client ----------
 
 function createFubClient({ apiKey, systemName, systemKey, fetchImpl = globalThis.fetch }) {
@@ -139,37 +191,44 @@ function createFubProcessor({ client, store, orgId, log = console, now = () => n
     for (const id of payload.resourceIds || []) {
       const activity = await client.get(`/${spec.resource}/${id}`);
       if (!seenShapes.has(spec.resource)) {
-        // First time we see each kind: log field names (no content) to confirm the format.
+        // First time we see each kind: log field names and shapes (no content).
         seenShapes.add(spec.resource);
         log.log(`FUB ${spec.resource} fields:`, Object.keys(activity || {}).join(','));
+        if (spec.resource === 'emails') log.log('FUB emails shape:', describeShape(activity));
       }
-      if (!isOutgoing(activity)) continue;
-      if (!activity.personId) continue;
+      const isEmail = spec.resource === 'emails';
+      // Calls/texts carry direction and the contact directly; emails don't.
+      if (!isEmail && !isOutgoing(activity)) continue;
+      const personIds = isEmail ? relatedPersonIds(activity) : [activity.personId].filter(Boolean);
 
-      const person = await client.get(`/people/${activity.personId}`);
-      const { phones, emails } = contactPoints(person);
-      if (!phones.length && !emails.length) continue;
+      for (const personId of personIds) {
+        const person = await client.get(`/people/${personId}`);
+        const { phones, emails } = contactPoints(person);
+        if (!phones.length && !emails.length) continue;
+        // An email counts only if it was sent TO this contact (not from them).
+        if (isEmail && !emailSentTo(activity, emails)) continue;
 
-      const activityAt = activity.created ? new Date(activity.created) : now();
-      const leads = await store.openLeads(orgId, new Date(now() - LOOKBACK_MS).toISOString());
-      const lead = leads.find((l) =>
-        (l.phone && phones.includes(last10(l.phone))) || (l.email && emails.includes(normEmail(l.email))));
-      if (!lead) continue;
-      // Only count outreach that happened after the lead was assigned.
-      if (lead.assigned_at && activityAt < new Date(lead.assigned_at)) continue;
+        const activityAt = activity.created ? new Date(activity.created) : now();
+        const leads = await store.openLeads(orgId, new Date(now() - LOOKBACK_MS).toISOString());
+        const lead = leads.find((l) =>
+          (l.phone && phones.includes(last10(l.phone))) || (l.email && emails.includes(normEmail(l.email))));
+        if (!lead || marked.includes(lead.id)) continue;
+        // Only count outreach that happened after the lead was assigned.
+        if (lead.assigned_at && activityAt < new Date(lead.assigned_at)) continue;
 
-      await store.markContacted(lead.id);
-      await store.logEvent(lead, 'contact_detected', {
-        channel: spec.channel,
-        verified: true,
-        source: 'follow_up_boss',
-        fub_id: id,
-        fub_user_id: activity.userId ?? null,
-        outcome: activity.outcome ?? null,
-        duration_seconds: activity.duration ?? null,
-      }).catch((e) => log.error('FUB log error:', e.message));
-      marked.push(lead.id);
-      log.log(`FUB ${spec.channel} marked lead ${lead.id} responded`);
+        await store.markContacted(lead.id);
+        await store.logEvent(lead, 'contact_detected', {
+          channel: spec.channel,
+          verified: true,
+          source: 'follow_up_boss',
+          fub_id: id,
+          fub_user_id: activity.userId ?? null,
+          outcome: activity.outcome ?? null,
+          duration_seconds: activity.duration ?? null,
+        }).catch((e) => log.error('FUB log error:', e.message));
+        marked.push(lead.id);
+        log.log(`FUB ${spec.channel} marked lead ${lead.id} responded`);
+      }
     }
     return marked;
   };
@@ -201,6 +260,9 @@ module.exports = {
   verifySignature,
   isOutgoing,
   contactPoints,
+  relatedPersonIds,
+  emailRoles,
+  emailSentTo,
   createFubClient,
   ensureWebhooks,
   createFubStore,

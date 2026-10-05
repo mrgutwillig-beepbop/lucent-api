@@ -47,16 +47,67 @@ test('outgoing FUB call to the lead marks it responded (verified)', async () => 
     fub_user_id: 3, outcome: 'Interested', duration_seconds: 42 } });
 });
 
-test('outgoing text and email also count, matched by email', async () => {
-  for (const event of ['textMessagesCreated', 'emailsCreated']) {
-    const { processWebhook, contacted, events } = setup({
-      activity: { personId: 55, isIncoming: false, created: '2026-10-05T18:59:00Z' },
-      person: { phones: [], emails: [{ value: 'Maria@Example.com' }] },
-    });
-    await processWebhook({ event, resourceIds: [1] });
-    assert.deepEqual(contacted, ['L1'], event);
-    assert.equal(events[0].data.channel, event === 'emailsCreated' ? 'fub_email' : 'fub_text');
-  }
+test('outgoing text counts, matched by phone', async () => {
+  const { processWebhook, contacted, events } = setup({
+    activity: { personId: 55, isIncoming: false, created: '2026-10-05T18:59:00Z' },
+  });
+  await processWebhook({ event: 'textMessagesCreated', resourceIds: [1] });
+  assert.deepEqual(contacted, ['L1']);
+  assert.equal(events[0].data.channel, 'fub_text');
+});
+
+// FUB emails: no personId / isIncoming; contact via relatedPeople, direction via addresses.
+const emailPerson = { phones: [], emails: [{ value: 'Maria@Example.com' }] };
+const sentEmail = (addresses, relatedPeople = [{ id: 55 }]) => ({
+  id: 9, userId: 3, created: '2026-10-05T18:59:00Z', status: 'Sent', addresses, relatedPeople,
+});
+
+test('email sent TO the lead counts (addresses keyed by role)', async () => {
+  const { processWebhook, contacted, events, gets } = setup({
+    activity: sentEmail({ from: [{ email: 'agent@brokerage.ca' }], to: [{ email: 'maria@example.com' }] }),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.deepEqual(contacted, ['L1']);
+  assert.deepEqual(gets, ['/emails/9', '/people/55']);
+  assert.equal(events[0].data.channel, 'fub_email');
+});
+
+test('email sent TO the lead counts (list of typed addresses, plain ids, display names)', async () => {
+  const { processWebhook, contacted } = setup({
+    activity: sentEmail(
+      [{ type: 'from', email: 'agent@brokerage.ca' }, { type: 'to', email: 'Maria Garcia <MARIA@example.com>' }],
+      [55],
+    ),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.deepEqual(contacted, ['L1']);
+});
+
+test('email FROM the lead (the lead writing in) does not count', async () => {
+  const { processWebhook, contacted } = setup({
+    activity: sentEmail({ from: ['maria@example.com'], to: ['agent@brokerage.ca'] }),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.equal(contacted.length, 0);
+});
+
+test('email with no related people is ignored', async () => {
+  const { processWebhook, contacted, gets } = setup({
+    activity: sentEmail({ to: ['maria@example.com'] }, []),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.equal(contacted.length, 0);
+  assert.deepEqual(gets, ['/emails/9']);
+});
+
+test('address parsing helpers', () => {
+  assert.deepEqual(fub.relatedPersonIds({ relatedPeople: [{ id: 1 }, 2, { personId: 3 }, { id: 1 }] }), [1, 2, 3]);
+  assert.deepEqual(fub.emailRoles({ from: 'A <a@x.com>', to: ['b@x.com'], cc: [{ address: 'c@x.com' }] }),
+    { from: ['a@x.com'], to: ['b@x.com', 'c@x.com'] });
 });
 
 test('incoming activity (the lead calling or writing in) does not count', async () => {
