@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { createMailer, resolveResendKey } = require('./mailer');
-const { createCallBridge, createCallStore, makeCallCode } = require('./callbridge');
+const { createCallBridge, createCallStore, createCallLink } = require('./callbridge');
 const { createReplyHandler, createReplyStore } = require('./replies');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
@@ -469,8 +469,12 @@ if (require.main === module) {
     validateTwilio: twilioValidator,
   });
 
+  // Links texted to agents can use a shorter domain (e.g. https://go.lucent-partners.com)
+  // pointed at this service; Twilio webhooks keep using PUBLIC_BASE_URL.
+  const linkBaseUrl = process.env.LINK_BASE_URL || publicBaseUrl;
+  const callLinkStore = createCallStore(supabase);
   const callLinkFor = callBridge
-    ? (lead) => (lead.assigned_to ? `${publicBaseUrl}/c/${makeCallCode(callSecret, lead.id, lead.assigned_to)}` : null)
+    ? (lead) => createCallLink({ store: callLinkStore, linkBase: linkBaseUrl, secret: callSecret, lead })
     : null;
 
   const app = createApp({

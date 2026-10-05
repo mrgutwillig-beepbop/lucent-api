@@ -60,6 +60,38 @@ function codeMatches(secret, code, leadId, agentId) {
   return expected.length === given.length && crypto.timingSafeEqual(expected, given);
 }
 
+// ---------- short codes ----------
+// The texted link uses an 8-character random code (e.g. /c/aB3x9K2q),
+// saved as a 'call_link' lead event with the agent it was issued to.
+// ~47 bits of randomness; still checked against the lead's current agent.
+
+const SHORT_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
+const SHORT_LEN = 8;
+
+function makeShortCode() {
+  const bytes = crypto.randomBytes(SHORT_LEN);
+  let out = '';
+  for (const b of bytes) out += SHORT_ALPHABET[b % SHORT_ALPHABET.length];
+  return out;
+}
+
+const isShortCode = (code) => typeof code === 'string' && code.length === SHORT_LEN && /^[A-Za-z0-9]+$/.test(code);
+
+// Returns the link to text the agent: short when it can be saved, otherwise
+// the longer signed link (which needs no storage) so a text is never lost.
+async function createCallLink({ store, linkBase, secret, lead, log = console }) {
+  if (!lead?.assigned_to) return null;
+  const base = String(linkBase || '').replace(/\/+$/, '');
+  try {
+    const code = makeShortCode();
+    await store.logEvent(lead, 'call_link', { code, agent_id: lead.assigned_to });
+    return `${base}/c/${code}`;
+  } catch (e) {
+    log.error('Short link save failed, using long link:', e.message);
+    return `${base}/c/${makeCallCode(secret, lead.id, lead.assigned_to)}`;
+  }
+}
+
 // ---------- pages ----------
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -107,6 +139,18 @@ function createCallStore(supabase) {
       });
       if (error) throw new Error(error.message);
     },
+    // Short link lookup: { lead_id, agent_id } or null.
+    async findCallLink(code) {
+      const { data, error } = await supabase.from('lead_events')
+        .select('lead_id, event_data')
+        .eq('event_type', 'call_link')
+        .eq('event_data->>code', code)
+        .order('created_at', { ascending: false })
+        .limit(1);
+      if (error) throw new Error(error.message);
+      const row = data?.[0];
+      return row ? { lead_id: row.lead_id, agent_id: row.event_data?.agent_id } : null;
+    },
   };
 }
 
@@ -119,11 +163,23 @@ function createCallBridge({ store, twilioClient, fromNumber, baseUrl, secret, va
 
   // Loads the lead behind a code and checks the link is still valid for the
   // lead's current agent. Returns { lead } or { error: <page html> }.
+  const invalid = () => ({ error: page('Link not valid', '<h1>Link not valid</h1><p>Please use the link from your latest Lucent text.</p>') });
+
   async function resolve(code) {
-    const parsed = parseCallCode(code);
-    if (!parsed) return { error: page('Link not valid', '<h1>Link not valid</h1><p>Please use the link from your latest Lucent text.</p>') };
-    const lead = await store.getLead(parsed.leadId);
-    if (!lead || !codeMatches(secret, code, lead.id, lead.assigned_to)) {
+    let lead;
+    let valid;
+    if (isShortCode(code)) {
+      const link = await store.findCallLink(code);
+      if (!link) return invalid();
+      lead = await store.getLead(link.lead_id);
+      valid = !!lead && !!link.agent_id && link.agent_id === lead.assigned_to;
+    } else {
+      const parsed = parseCallCode(code);
+      if (!parsed) return invalid();
+      lead = await store.getLead(parsed.leadId);
+      valid = !!lead && codeMatches(secret, code, lead.id, lead.assigned_to);
+    }
+    if (!valid) {
       return { error: page('Lead reassigned', '<h1>This lead has moved</h1><p>It was reassigned to another agent, so this link no longer works.</p>') };
     }
     if (!OPEN_STATUSES.has(lead.status) || (lead.assigned_at && now() - new Date(lead.assigned_at) > LINK_MAX_AGE_MS)) {
@@ -224,8 +280,15 @@ function createCallBridge({ store, twilioClient, fromNumber, baseUrl, secret, va
       failed: 'The call could not be connected. Please try the lead directly. Goodbye.',
     }[outcome];
     try {
-      const parsed = parseCallCode(req.params.code);
-      const lead = parsed && await store.getLead(parsed.leadId);
+      const code = req.params.code;
+      let lead = null;
+      if (isShortCode(code)) {
+        const link = await store.findCallLink(code);
+        lead = link && await store.getLead(link.lead_id);
+      } else {
+        const parsed = parseCallCode(code);
+        lead = parsed && await store.getLead(parsed.leadId);
+      }
       if (lead) {
         await store.logEvent(lead, 'call_ended', {
           channel: 'tap_to_call',
@@ -242,4 +305,4 @@ function createCallBridge({ store, twilioClient, fromNumber, baseUrl, secret, va
   return router;
 }
 
-module.exports = { createCallBridge, createCallStore, makeCallCode, parseCallCode, codeMatches };
+module.exports = { createCallBridge, createCallStore, createCallLink, makeCallCode, makeShortCode, parseCallCode, codeMatches };

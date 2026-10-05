@@ -1,7 +1,7 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const express = require('express');
-const { createCallBridge, makeCallCode, parseCallCode, codeMatches } = require('../callbridge');
+const { createCallBridge, createCallLink, makeCallCode, makeShortCode, parseCallCode, codeMatches } = require('../callbridge');
 const { agentAssignmentMessage } = require('../enforcement');
 
 const SECRET = 'call-secret';
@@ -20,12 +20,13 @@ function lead(overrides = {}) {
   };
 }
 
-function setup({ current = lead(), validate = () => true } = {}) {
+function setup({ current = lead(), validate = () => true, links = {} } = {}) {
   const calls = [];
   const events = [];
   const contacted = [];
   const store = {
     getLead: async (id) => (id === current.id ? current : null),
+    findCallLink: async (c) => links[c] || null,
     markContacted: async (id) => { contacted.push(id); },
     logEvent: async (l, type, data) => { events.push({ type, data }); },
   };
@@ -174,5 +175,72 @@ test('agent hears why the call did not connect', async () => {
     assert.match(failed, /could not be connected/);
     const ok = await (await post(`${url}/twilio/voice/done/${code}`, { DialCallStatus: 'completed', DialCallDuration: '5' })).text();
     assert.doesNotMatch(ok, /<Say>/);
+  });
+});
+
+// ---------- short links ----------
+
+test('short codes are 8 unambiguous characters and unique', () => {
+  const seen = new Set();
+  for (let i = 0; i < 500; i++) {
+    const c = makeShortCode();
+    assert.match(c, /^[A-HJ-NP-Za-km-z2-9]{8}$/);
+    seen.add(c);
+  }
+  assert.equal(seen.size, 500);
+});
+
+test('createCallLink saves the code with the agent and returns a short URL', async () => {
+  const saved = [];
+  const store = { logEvent: async (l, type, data) => { saved.push({ type, data }); } };
+  const url = await createCallLink({ store, linkBase: 'https://go.lucent.test/', secret: SECRET, lead: lead() });
+  assert.match(url, /^https:\/\/go\.lucent\.test\/c\/[A-Za-z0-9]{8}$/);
+  assert.equal(saved[0].type, 'call_link');
+  assert.equal(saved[0].data.agent_id, AGENT_1);
+  assert.equal(url.endsWith(saved[0].data.code), true);
+});
+
+test('if saving fails, the agent still gets a working (long) link', async () => {
+  const store = { logEvent: async () => { throw new Error('db down'); } };
+  const url = await createCallLink({ store, linkBase: BASE, secret: SECRET, lead: lead(), log: { error() {} } });
+  assert.equal(url, `${BASE}/c/${code}`);
+});
+
+test('short link opens the call page and rings the agent', async () => {
+  const short = 'aB3x9K2q';
+  const { app, calls } = setup({ links: { [short]: { lead_id: LEAD_ID, agent_id: AGENT_1 } } });
+  await withServer(app, async (url) => {
+    assert.match(await (await fetch(`${url}/c/${short}`)).text(), /Call Maria Garcia/);
+    assert.equal((await post(`${url}/c/${short}`)).status, 200);
+    assert.equal(calls[0].url, `${BASE}/twilio/voice/connect/${short}`);
+  });
+});
+
+test('short link stops working after reassignment', async () => {
+  const short = 'aB3x9K2q';
+  const { app, calls } = setup({ current: lead({ assigned_to: AGENT_2 }), links: { [short]: { lead_id: LEAD_ID, agent_id: AGENT_1 } } });
+  await withServer(app, async (url) => {
+    assert.equal((await post(`${url}/c/${short}`)).status, 410);
+    assert.equal(calls.length, 0);
+  });
+});
+
+test('unknown short code is rejected', async () => {
+  const { app } = setup();
+  await withServer(app, async (url) => {
+    const res = await fetch(`${url}/c/zzzzzzzz`);
+    assert.equal(res.status, 410);
+    assert.match(await res.text(), /Link not valid/);
+  });
+});
+
+test('pressing 1 on a short-link call marks responded and logs the outcome', async () => {
+  const short = 'aB3x9K2q';
+  const { app, contacted, events } = setup({ links: { [short]: { lead_id: LEAD_ID, agent_id: AGENT_1 } } });
+  await withServer(app, async (url) => {
+    await post(`${url}/twilio/voice/dial/${short}`, { Digits: '1' });
+    await post(`${url}/twilio/voice/done/${short}`, { DialCallStatus: 'completed', DialCallDuration: '9' });
+    assert.deepEqual(contacted, [LEAD_ID]);
+    assert.deepEqual(events.map((e) => e.type), ['call_started', 'call_ended']);
   });
 });

@@ -84,7 +84,7 @@ function createEnforcementWorker({ store, notifier, callLinkFor = null, now = ()
       const claimed = await store.claimNotification(lead.id);
       if (!claimed) continue;
       let callUrl = null;
-      try { callUrl = callLinkFor ? callLinkFor(lead) : null; } catch (e) { log.error('Call link error:', e.message); }
+      try { callUrl = callLinkFor ? await callLinkFor(lead) : null; } catch (e) { log.error('Call link error:', e.message); }
       const r = await sms(lead.agents?.phone, agentAssignmentMessage(lead, callUrl));
       if (r.sent) count++;
     }
