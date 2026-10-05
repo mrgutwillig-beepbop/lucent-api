@@ -214,8 +214,15 @@ function createCallBridge({ store, twilioClient, fromNumber, baseUrl, secret, va
       `<Number>${xmlEsc(lead.phone)}</Number></Dial>`);
   });
 
-  // Call ended: keep the outcome for reporting.
+  // Call ended: keep the outcome for reporting, and tell the agent if the
+  // lead could not be reached (instead of silence).
   router.post('/twilio/voice/done/:code', form, twilioOnly, async (req, res) => {
+    const outcome = req.body?.DialCallStatus;
+    const spoken = {
+      'no-answer': 'No answer. Your attempt has been recorded. Goodbye.',
+      busy: 'The line is busy. Your attempt has been recorded. Goodbye.',
+      failed: 'The call could not be connected. Please try the lead directly. Goodbye.',
+    }[outcome];
     try {
       const parsed = parseCallCode(req.params.code);
       const lead = parsed && await store.getLead(parsed.leadId);
@@ -229,7 +236,7 @@ function createCallBridge({ store, twilioClient, fromNumber, baseUrl, secret, va
     } catch (e) {
       log.error('Call end log error:', e.message);
     }
-    twiml(res, '<Hangup/>');
+    twiml(res, spoken ? `<Say>${spoken}</Say><Hangup/>` : '<Hangup/>');
   });
 
   return router;

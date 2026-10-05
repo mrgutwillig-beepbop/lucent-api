@@ -166,3 +166,13 @@ test('agent lead text includes the tap-to-call link', () => {
   assert.match(msg, new RegExp(`Tap to call: ${BASE}/c/${code}`));
   assert.doesNotMatch(agentAssignmentMessage({ ...lead(), phone: null }, `${BASE}/c/${code}`), /Tap to call/);
 });
+
+test('agent hears why the call did not connect', async () => {
+  const { app } = setup();
+  await withServer(app, async (url) => {
+    const failed = await (await post(`${url}/twilio/voice/done/${code}`, { DialCallStatus: 'failed' })).text();
+    assert.match(failed, /could not be connected/);
+    const ok = await (await post(`${url}/twilio/voice/done/${code}`, { DialCallStatus: 'completed', DialCallDuration: '5' })).text();
+    assert.doesNotMatch(ok, /<Say>/);
+  });
+});
