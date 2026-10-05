@@ -40,6 +40,7 @@ function agentAssignmentMessage(lead, callUrl) {
   if (lead.source) lines.push(`Source: ${lead.source}`);
   if (mins) lines.push(`Please respond within ${mins} min.`);
   if (callUrl && lead.phone) lines.push(`Tap to call: ${callUrl}`);
+  lines.push('Emailed or texted them? Reply 1');
   return testPrefix(lead.organizations?.name) + lines.join('\n');
 }
 

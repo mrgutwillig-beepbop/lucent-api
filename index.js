@@ -4,6 +4,7 @@ const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const { createMailer, resolveResendKey } = require('./mailer');
 const { createCallBridge, createCallStore, makeCallCode } = require('./callbridge');
+const { createReplyHandler, createReplyStore } = require('./replies');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -13,8 +14,11 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null } = {}) {
   const app = express();
+
+  // Agents' "Reply 1" texts (Twilio inbound SMS webhook).
+  if (replyHandler) app.use(replyHandler);
 
   // Tap-to-call pages and Twilio voice webhooks (no API key; secured by
   // signed links and Twilio request signatures).
@@ -456,6 +460,15 @@ if (require.main === module) {
           : null,
       })
     : null;
+  const twilioValidator = process.env.TWILIO_AUTH_TOKEN
+    ? (sig, url, params) => twilio.validateRequest(process.env.TWILIO_AUTH_TOKEN, sig, url, params)
+    : null;
+  const replyHandler = createReplyHandler({
+    store: createReplyStore(supabase),
+    baseUrl: publicBaseUrl,
+    validateTwilio: twilioValidator,
+  });
+
   const callLinkFor = callBridge
     ? (lead) => (lead.assigned_to ? `${publicBaseUrl}/c/${makeCallCode(callSecret, lead.id, lead.assigned_to)}` : null)
     : null;
@@ -466,7 +479,8 @@ if (require.main === module) {
     twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
     mailer,
     fromEmail,
-    callBridge
+    callBridge,
+    replyHandler
   });
 
   const PORT = process.env.PORT || 3000;
