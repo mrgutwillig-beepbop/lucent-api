@@ -66,8 +66,20 @@ function contactPoints(person) {
 // relatedPeople, and direction from the addresses (from / to / cc / bcc).
 
 function relatedPersonIds(email) {
+  return relatedPeople(email).map((p) => p.id);
+}
+
+// [{ id, sentByPerson }] — FUB marks each related person with sentByPerson
+// (true = the contact sent this email, false = it was sent to them).
+function relatedPeople(email) {
   const list = Array.isArray(email?.relatedPeople) ? email.relatedPeople : [];
-  return [...new Set(list.map((p) => (typeof p === 'object' && p ? (p.id ?? p.personId) : p)).filter(Boolean))];
+  const out = new Map();
+  for (const p of list) {
+    const id = typeof p === 'object' && p ? (p.personId ?? p.id) : p;
+    if (!id || out.has(id)) continue;
+    out.set(id, { id, sentByPerson: typeof p === 'object' && p ? p.sentByPerson : undefined });
+  }
+  return [...out.values()];
 }
 
 // Pulls email addresses out of a value that may be a string, an object
@@ -110,7 +122,8 @@ function emailSentTo(email, contactEmails) {
 function describeShape(email) {
   const shape = (v) => (Array.isArray(v) ? `array(${v.length})[${v.length ? shape(v[0]) : ''}]`
     : v && typeof v === 'object' ? `{${Object.keys(v).join(',')}}` : typeof v);
-  return `addresses=${shape(email?.addresses)} relatedPeople=${shape(email?.relatedPeople)}`;
+  const to = email?.addresses?.to;
+  return `addresses=${shape(email?.addresses)} to=${shape(to)} relatedPeople=${shape(email?.relatedPeople)}`;
 }
 
 // ---------- FUB API client ----------
@@ -199,14 +212,16 @@ function createFubProcessor({ client, store, orgId, log = console, now = () => n
       const isEmail = spec.resource === 'emails';
       // Calls/texts carry direction and the contact directly; emails don't.
       if (!isEmail && !isOutgoing(activity)) continue;
-      const personIds = isEmail ? relatedPersonIds(activity) : [activity.personId].filter(Boolean);
+      const people = isEmail ? relatedPeople(activity) : [{ id: activity.personId }].filter((p) => p.id);
 
-      for (const personId of personIds) {
+      for (const { id: personId, sentByPerson } of people) {
+        // Email from the contact (they wrote in) never counts.
+        if (isEmail && sentByPerson === true) continue;
         const person = await client.get(`/people/${personId}`);
         const { phones, emails } = contactPoints(person);
         if (!phones.length && !emails.length) continue;
-        // An email counts only if it was sent TO this contact (not from them).
-        if (isEmail && !emailSentTo(activity, emails)) continue;
+        // Without the sentByPerson flag, fall back to the addresses.
+        if (isEmail && sentByPerson !== false && !emailSentTo(activity, emails)) continue;
 
         const activityAt = activity.created ? new Date(activity.created) : now();
         const leads = await store.openLeads(orgId, new Date(now() - LOOKBACK_MS).toISOString());
@@ -261,6 +276,7 @@ module.exports = {
   isOutgoing,
   contactPoints,
   relatedPersonIds,
+  relatedPeople,
   emailRoles,
   emailSentTo,
   createFubClient,

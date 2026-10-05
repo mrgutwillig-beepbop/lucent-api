@@ -104,6 +104,26 @@ test('email with no related people is ignored', async () => {
   assert.deepEqual(gets, ['/emails/9']);
 });
 
+test('email to the lead counts from FUB\'s sentByPerson flag, whatever the address format', async () => {
+  const { processWebhook, contacted } = setup({
+    activity: sentEmail({ to: [{ unknownShape: 'x' }], from: [], cc: [], bcc: [] },
+      [{ personId: 55, sentByPerson: false, threadId: 1 }]),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.deepEqual(contacted, ['L1']);
+});
+
+test('email the lead sent (sentByPerson true) does not count and skips the lookup', async () => {
+  const { processWebhook, contacted, gets } = setup({
+    activity: sentEmail({ to: ['maria@example.com'] }, [{ personId: 55, sentByPerson: true }]),
+    person: emailPerson,
+  });
+  await processWebhook({ event: 'emailsCreated', resourceIds: [9] });
+  assert.equal(contacted.length, 0);
+  assert.deepEqual(gets, ['/emails/9']);
+});
+
 test('address parsing helpers', () => {
   assert.deepEqual(fub.relatedPersonIds({ relatedPeople: [{ id: 1 }, 2, { personId: 3 }, { id: 1 }] }), [1, 2, 3]);
   assert.deepEqual(fub.emailRoles({ from: 'A <a@x.com>', to: ['b@x.com'], cc: [{ address: 'c@x.com' }] }),
