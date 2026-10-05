@@ -5,6 +5,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { createMailer, resolveResendKey } = require('./mailer');
 const { createCallBridge, createCallStore, createCallLink } = require('./callbridge');
 const { createReplyHandler, createReplyStore } = require('./replies');
+const fub = require('./fub');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -14,8 +15,12 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null, fubHandler = null } = {}) {
   const app = express();
+
+  // Follow Up Boss webhooks (needs the raw body for signature checks, so it
+  // is mounted before express.json()).
+  if (fubHandler) app.use(fubHandler);
 
   // Agents' "Reply 1" texts (Twilio inbound SMS webhook).
   if (replyHandler) app.use(replyHandler);
@@ -477,8 +482,28 @@ if (require.main === module) {
     ? (lead) => createCallLink({ store: callLinkStore, linkBase: linkBaseUrl, secret: callSecret, lead })
     : null;
 
+  // Follow Up Boss response detection (enabled when its variables are set).
+  let fubHandler = null;
+  let fubClient = null;
+  if (process.env.FUB_API_KEY && process.env.FUB_SYSTEM_KEY && process.env.FUB_ORG_ID) {
+    fubClient = fub.createFubClient({
+      apiKey: process.env.FUB_API_KEY,
+      systemName: process.env.FUB_SYSTEM || 'LucentPartners',
+      systemKey: process.env.FUB_SYSTEM_KEY,
+    });
+    fubHandler = fub.createFubWebhookHandler({
+      systemKey: process.env.FUB_SYSTEM_KEY,
+      processWebhook: fub.createFubProcessor({
+        client: fubClient,
+        store: fub.createFubStore(supabase),
+        orgId: process.env.FUB_ORG_ID,
+      }),
+    });
+  }
+
   const app = createApp({
     supabase,
+    fubHandler,
     twilioClient,
     twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
     mailer,
@@ -494,6 +519,12 @@ if (require.main === module) {
     console.log(`📧 Email provider: ${mailer ? 'Resend' : 'disabled'}`);
     console.log(`📱 SMS provider: ${twilioClient ? 'Twilio' : 'disabled'}`);
     console.log(`📞 Tap-to-call: ${callBridge ? 'enabled' : 'disabled'}`);
+    console.log(`🔗 Follow Up Boss: ${fubClient ? 'enabled' : 'disabled'}`);
+    if (fubClient) {
+      fub.ensureWebhooks({ client: fubClient, url: `${publicBaseUrl}${fub.WEBHOOK_PATH}` })
+        .then((created) => console.log(`FUB webhooks ready (${created.length} new)`))
+        .catch((e) => console.error('FUB webhook setup failed:', e.message));
+    }
   });
 
   // Enforcement worker: agent texts, manager escalation, reassignment.
