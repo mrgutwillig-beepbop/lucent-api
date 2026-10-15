@@ -170,10 +170,10 @@ async function withServer(fn) {
   const server = http.createServer(app);
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${server.address().port}`;
-  const req = async (method, path, { form, cookie, origin = base } = {}) => {
+  const req = async (method, path, { form, cookie, origin = base, headers: extra = {} } = {}) => {
     const res = await fetch(base + path, {
       method, redirect: 'manual',
-      headers: { origin, ...(cookie ? { cookie } : {}), ...(form ? { 'content-type': 'application/x-www-form-urlencoded' } : {}) },
+      headers: { origin, ...(cookie ? { cookie } : {}), ...(form ? { 'content-type': 'application/x-www-form-urlencoded' } : {}), ...extra },
       body: form ? new URLSearchParams(form).toString() : undefined,
     });
     return { status: res.status, location: res.headers.get('location'), setCookie: res.headers.get('set-cookie'), text: await res.text() };
@@ -242,5 +242,15 @@ test('link requests are rate limited per email', async () => {
   await withServer(async ({ req, sent }) => {
     for (let i = 0; i < 7; i += 1) await req('POST', '/dashboard/login', { form: { email: 'boss@maple.ca' } });
     assert.equal(sent.length, 5);
+  });
+});
+
+test('browser form posts are accepted by Sec-Fetch-Site and refused cross-site', async () => {
+  await withServer(async ({ req, sent }) => {
+    const ok = await req('POST', '/dashboard/login', { form: { email: 'boss@maple.ca' }, origin: 'null', headers: { 'sec-fetch-site': 'same-origin' } });
+    assert.equal(ok.status, 200);
+    assert.equal(sent.length, 1);
+    const bad = await req('POST', '/dashboard/login', { form: { email: 'boss@maple.ca' }, headers: { 'sec-fetch-site': 'cross-site' } });
+    assert.equal(bad.status, 403);
   });
 });

@@ -252,10 +252,13 @@ function createAdminRouter({ password, store, crmService, crmStore, dashboardSto
     }
     // Forms only from this page (blocks cross-site form posts).
     if (req.method === 'POST') {
-      const origin = req.headers.origin || req.headers.referer || '';
-      let host = null;
-      try { host = new URL(origin).host; } catch { /* missing */ }
-      if (host !== req.headers.host) return res.status(403).send('Forbidden');
+      const site = req.headers['sec-fetch-site'];
+      let ok = site ? site === 'same-origin' : false;
+      if (!site) {
+        const origin = req.headers.origin || req.headers.referer || '';
+        try { ok = new URL(origin).host === req.headers.host; } catch { /* missing */ }
+      }
+      if (!ok) return res.status(403).send('Forbidden');
     }
     next();
   });

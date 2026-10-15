@@ -450,7 +450,11 @@ function createDashboardRouter({ store, data, mailer = null, fromEmail = null, s
     if (hits.size > 5000) hits.delete(hits.keys().next().value);
     return list.length > max;
   };
+  // Form posts must come from this site. Browsers send Sec-Fetch-Site; older
+  // ones are checked by Origin/Referer.
   const sameOrigin = (req) => {
+    const site = req.headers['sec-fetch-site'];
+    if (site) return site === 'same-origin';
     const origin = req.headers.origin || req.headers.referer || '';
     try { return new URL(origin).host === req.headers.host; } catch { return false; }
   };
@@ -460,7 +464,7 @@ function createDashboardRouter({ store, data, mailer = null, fromEmail = null, s
   router.use('/dashboard', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     res.set('X-Frame-Options', 'DENY');
-    res.set('Referrer-Policy', 'no-referrer');
+    res.set('Referrer-Policy', 'same-origin'); // 'no-referrer' makes browsers send Origin: null on form posts
     if (req.method === 'POST' && !sameOrigin(req)) return res.status(403).send('Forbidden');
     next();
   });
