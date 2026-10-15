@@ -158,3 +158,34 @@ test('unknown or malformed brokerage ids return 404', async () => {
     assert.equal((await req('GET', '/admin/orgs/44444444-4444-4444-8444-444444444444')).status, 404);
   });
 });
+
+test('gives and removes dashboard access, and previews the dashboard', async () => {
+  const f = fakes();
+  const users = [];
+  const dashboardStore = {
+    async listUsers() { return users; },
+    async addUser(orgId, email, name) { users.push({ id: '55555555-5555-4555-8555-555555555555', org_id: orgId, email, name }); },
+    async removeUser(orgId, id) { const i = users.findIndex((u) => u.id === id); if (i >= 0) users.splice(i, 1); },
+  };
+  const dashboardData = { async summary(orgId, range) { return { orgId, range }; }, async lead() { return null; } };
+  const app = express();
+  app.use(createAdminRouter({ password: 'pw-123456', store: f.store, crmService: f.crmService, crmStore: f.crmStore, dashboardStore, dashboardData, dashboardUrl: 'https://x/dashboard', log: silent }));
+  const server = http.createServer(app);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const headers = { authorization: `Basic ${Buffer.from('a:pw-123456').toString('base64')}`, origin: base, 'content-type': 'application/x-www-form-urlencoded' };
+  try {
+    await fetch(`${base}/admin/orgs/${ORG}/managers`, { method: 'POST', redirect: 'manual', headers, body: 'name=Pat&email=Pat%40Maple.ca' });
+    assert.equal(users[0].email, 'pat@maple.ca');
+    const page = await (await fetch(`${base}/admin/orgs/${ORG}`, { headers })).text();
+    assert.match(page, /Dashboard access/);
+    assert.match(page, /pat@maple\.ca/);
+    const preview = await (await fetch(`${base}/admin/orgs/${ORG}/dashboard`, { headers })).text();
+    assert.match(preview, /Admin preview/);
+    assert.match(preview, new RegExp(`data-api="/admin/orgs/${ORG}/dashboard"`));
+    const data = await (await fetch(`${base}/admin/orgs/${ORG}/dashboard/data?range=today`, { headers })).json();
+    assert.deepEqual(data, { orgId: ORG, range: 'today' });
+    await fetch(`${base}/admin/orgs/${ORG}/managers/${users[0].id}/delete`, { method: 'POST', redirect: 'manual', headers, body: '' });
+    assert.equal(users.length, 0);
+  } finally { server.close(); }
+});

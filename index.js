@@ -10,6 +10,7 @@ const { deriveKey, createSecretBox } = require('./secrets');
 const { createCrmStore, createCrmService } = require('./crm');
 const { createBoldTrailClient, createBoldTrailPoller } = require('./boldtrail');
 const { createAdminRouter, createAdminStore } = require('./admin');
+const { createDashboardRouter, createDashboardStore, createDashboardData, deriveSessionKey } = require('./dashboard');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -19,8 +20,9 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null, fubHandler = null, adminRouter = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null, fubHandler = null, adminRouter = null, dashboardRouter = null } = {}) {
   const app = express();
+  app.set('trust proxy', 1); // Railway's proxy: real client address for rate limits
 
   // Follow Up Boss webhooks (needs the raw body for signature checks, so it
   // is mounted before express.json()).
@@ -28,6 +30,9 @@ function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mai
 
   // Onboarding admin page (/admin, password protected).
   if (adminRouter) app.use(adminRouter);
+
+  // Manager dashboard (/dashboard, email sign-in links).
+  if (dashboardRouter) app.use(dashboardRouter);
 
   // Agents' "Reply 1" texts (Twilio inbound SMS webhook).
   if (replyHandler) app.use(replyHandler);
@@ -515,8 +520,19 @@ if (require.main === module) {
     ? fub.createFubWebhookHandler({ resolve: crmService.fubProcessorForToken, systemKey: process.env.FUB_SYSTEM_KEY })
     : null;
 
+  // Manager dashboard.
+  const dashboardStore = createDashboardStore(supabase);
+  const dashboardData = createDashboardData(dashboardStore);
+  const dashboardRouter = createDashboardRouter({
+    store: dashboardStore, data: dashboardData, mailer, fromEmail,
+    sessionKey: deriveSessionKey(), linkBaseUrl: linkBaseUrl,
+  });
+
   const adminRouter = crmService
-    ? createAdminRouter({ password: process.env.ADMIN_PASSWORD, store: createAdminStore(supabase), crmService, crmStore })
+    ? createAdminRouter({
+        password: process.env.ADMIN_PASSWORD, store: createAdminStore(supabase), crmService, crmStore,
+        dashboardStore, dashboardData, dashboardUrl: `${linkBaseUrl.replace(/\/+$/, '')}/dashboard`,
+      })
     : null;
   if (!process.env.ADMIN_PASSWORD) console.warn('⚠️  Admin page disabled (ADMIN_PASSWORD not set)');
 
@@ -524,6 +540,7 @@ if (require.main === module) {
     supabase,
     fubHandler,
     adminRouter,
+    dashboardRouter,
     twilioClient,
     twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
     mailer,

@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const express = require('express');
 const { isValidPhone, normalizePhone } = require('./sms');
 const { PROVIDERS } = require('./crm');
+const { dashboardPage } = require('./dashboard');
 
 const TIMEZONES = [
   'America/Toronto', 'America/Vancouver', 'America/Edmonton', 'America/Winnipeg',
@@ -179,7 +180,7 @@ function homePage(orgs, flash) {
 <div class="card"><h2>Add a brokerage</h2><form method="post" action="/admin/orgs">${orgFields()}<p><button>Create brokerage</button></p></form></div>`, flash);
 }
 
-function orgPage({ org, agents, connections, fubUrl }, flash) {
+function orgPage({ org, agents, connections, fubUrl, managers = null, dashboardUrl = '' }, flash) {
   const agentRows = agents.map((a) => `<tr><td>${esc(a.name)}</td><td class="hide-sm">${esc(a.email)}</td><td>${esc(a.phone)}</td>
 <td>${a.is_active ? '<span class="ok">Active</span>' : '<span class="muted">Off</span>'}</td>
 <td><form method="post" action="/admin/orgs/${org.id}/agents/${a.id}/toggle"><button class="ghost">${a.is_active ? 'Switch off' : 'Switch on'}</button></form></td></tr>`).join('');
@@ -188,7 +189,18 @@ function orgPage({ org, agents, connections, fubUrl }, flash) {
 <td>${c.status === 'active' ? '<span class="ok">Connected</span>' : `<span class="bad">${esc(c.status)}</span>`}${c.last_error ? `<div class="muted">${esc(c.last_error)}</div>` : ''}</td>
 <td><form method="post" action="/admin/orgs/${org.id}/crm/${c.provider}/delete"><button class="danger">Disconnect</button></form></td></tr>`).join('');
 
+  const managerRows = (managers || []).map((m) => `<tr><td>${esc(m.name || '')}</td><td>${esc(m.email)}</td>
+<td class="hide-sm">${m.last_login_at ? esc(new Date(m.last_login_at).toISOString().slice(0, 10)) : '<span class="muted">Never</span>'}</td>
+<td><form method="post" action="/admin/orgs/${org.id}/managers/${m.id}/delete"><button class="danger">Remove</button></form></td></tr>`).join('');
+  const managersCard = managers === null ? '' : `<div class="card"><h2>Dashboard access</h2>
+<p class="muted">Managers sign in at <code>${esc(dashboardUrl)}</code> with their email; Lucent emails them a one-time link. <a href="/admin/orgs/${org.id}/dashboard">Preview this brokerage's dashboard</a></p>
+${managers.length ? `<table><tr><th>Name</th><th>Email</th><th class="hide-sm">Last sign-in</th><th></th></tr>${managerRows}</table>` : '<p class="muted">No managers yet.</p>'}
+<form method="post" action="/admin/orgs/${org.id}/managers" style="margin-top:14px"><div class="grid">
+${field('Name', 'name')}${field('Email *', 'email', '', 'email', 'required')}
+</div><p><button>Give dashboard access</button></p></form></div>`;
+
   return page(org.name, `<h1>${esc(org.name)}</h1><p class="muted">Brokerage ID (for lead intake): <code>${esc(org.id)}</code></p>
+${managersCard}
 <div class="card"><h2>Agents</h2>
 ${agents.length ? `<table><tr><th>Name</th><th class="hide-sm">Email</th><th>Mobile</th><th>Status</th><th></th></tr>${agentRows}</table>` : '<p class="muted">No agents yet.</p>'}
 <form method="post" action="/admin/orgs/${org.id}/agents" style="margin-top:14px"><div class="grid">
@@ -211,7 +223,7 @@ ${field('API key (from the brokerage owner/admin)', 'api_key', '', 'password', '
 
 // ---------- router ----------
 
-function createAdminRouter({ password, store, crmService, crmStore, log = console }) {
+function createAdminRouter({ password, store, crmService, crmStore, dashboardStore = null, dashboardData = null, dashboardUrl = '/dashboard', log = console }) {
   const router = express.Router();
   if (!password) return router; // disabled
 
@@ -270,8 +282,12 @@ function createAdminRouter({ password, store, crmService, crmStore, log = consol
   router.get('/admin/orgs/:orgId', wrap(async (req, res) => {
     const org = await store.getOrg(req.params.orgId);
     if (!org) return res.status(404).send(page('Not found', '<h1>Brokerage not found</h1>'));
-    const [agents, connections] = await Promise.all([store.listAgents(org.id), crmStore.getByOrg(org.id)]);
-    res.send(orgPage({ org, agents, connections, fubUrl: crmService.fubUrl('…') }, takeFlash(req)));
+    const [agents, connections, managers] = await Promise.all([
+      store.listAgents(org.id), crmStore.getByOrg(org.id),
+      // null hides the section (e.g. before migration 005 is applied)
+      dashboardStore ? dashboardStore.listUsers(org.id).catch(() => null) : null,
+    ]);
+    res.send(orgPage({ org, agents, connections, managers, dashboardUrl, fubUrl: crmService.fubUrl('…') }, takeFlash(req)));
   }));
 
   router.post('/admin/orgs/:orgId', wrap(async (req, res) => {
@@ -316,6 +332,40 @@ function createAdminRouter({ password, store, crmService, crmStore, log = consol
     await crmService.disconnect(orgId, provider);
     back(res, `/admin/orgs/${orgId}`, true, `${PROVIDERS[provider]} disconnected.`);
   }));
+
+  // Dashboard access and preview
+  if (dashboardStore && dashboardData) {
+    router.post('/admin/orgs/:orgId/managers', wrap(async (req, res) => {
+      const orgId = req.params.orgId;
+      const path = `/admin/orgs/${orgId}`;
+      const email = String(req.body.email || '').trim().toLowerCase();
+      const name = String(req.body.name || '').trim() || null;
+      if (!EMAIL.test(email)) return back(res, path, false, 'Manager email looks wrong.');
+      if (!(await store.getOrg(orgId))) return res.status(404).send('Not found');
+      await dashboardStore.addUser(orgId, email, name);
+      back(res, path, true, `${email} can now sign in to the dashboard.`);
+    }));
+    router.post('/admin/orgs/:orgId/managers/:userId/delete', wrap(async (req, res) => {
+      const { orgId, userId } = req.params;
+      await dashboardStore.removeUser(orgId, userId);
+      back(res, `/admin/orgs/${orgId}`, true, 'Dashboard access removed.');
+    }));
+    router.param('userId', (req, res, next, id) => (UUID.test(id) ? next() : res.status(404).send('Not found')));
+    router.get('/admin/orgs/:orgId/dashboard', wrap(async (req, res) => {
+      const org = await store.getOrg(req.params.orgId);
+      if (!org) return res.status(404).send('Not found');
+      const banner = `<div style="background:#1f5eff;color:#fff;padding:8px 16px;font-size:14px">Admin preview of what ${esc(org.name)}'s managers see. <a style="color:#fff" href="/admin/orgs/${org.id}">Back to setup</a></div>`;
+      res.send(dashboardPage({ title: org.name, apiBase: `/admin/orgs/${org.id}/dashboard`, canSignOut: false, banner }));
+    }));
+    router.get('/admin/orgs/:orgId/dashboard/data', wrap(async (req, res) => {
+      const out = await dashboardData.summary(req.params.orgId, String(req.query.range || '7d'));
+      return out ? res.json(out) : res.status(404).json({ error: 'Not found' });
+    }));
+    router.get('/admin/orgs/:orgId/dashboard/leads/:leadId', wrap(async (req, res) => {
+      const out = await dashboardData.lead(req.params.orgId, req.params.leadId);
+      return out ? res.json(out) : res.status(404).json({ error: 'Not found' });
+    }));
+  }
 
   return router;
 }
