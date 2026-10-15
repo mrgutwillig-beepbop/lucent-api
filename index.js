@@ -6,6 +6,10 @@ const { createMailer, resolveResendKey } = require('./mailer');
 const { createCallBridge, createCallStore, createCallLink } = require('./callbridge');
 const { createReplyHandler, createReplyStore } = require('./replies');
 const fub = require('./fub');
+const { deriveKey, createSecretBox } = require('./secrets');
+const { createCrmStore, createCrmService } = require('./crm');
+const { createBoldTrailClient, createBoldTrailPoller } = require('./boldtrail');
+const { createAdminRouter, createAdminStore } = require('./admin');
 const twilio = require('twilio');
 const { isValidPhone, sendIntakeSms } = require('./sms');
 
@@ -15,12 +19,15 @@ const { isValidPhone, sendIntakeSms } = require('./sms');
 // with mock Supabase / Twilio clients (see test/intake.test.js).
 // =====================================================
 
-function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null, fubHandler = null } = {}) {
+function createApp({ supabase, twilioClient = null, twilioFromNumber = null, mailer = null, fromEmail = null, callBridge = null, replyHandler = null, fubHandler = null, adminRouter = null } = {}) {
   const app = express();
 
   // Follow Up Boss webhooks (needs the raw body for signature checks, so it
   // is mounted before express.json()).
   if (fubHandler) app.use(fubHandler);
+
+  // Onboarding admin page (/admin, password protected).
+  if (adminRouter) app.use(adminRouter);
 
   // Agents' "Reply 1" texts (Twilio inbound SMS webhook).
   if (replyHandler) app.use(replyHandler);
@@ -488,28 +495,35 @@ if (require.main === module) {
     ? (lead) => createCallLink({ store: callLinkStore, linkBase: linkBaseUrl, secret: callSecret, lead })
     : null;
 
-  // Follow Up Boss response detection (enabled when its variables are set).
-  let fubHandler = null;
-  let fubClient = null;
-  if (process.env.FUB_API_KEY && process.env.FUB_SYSTEM_KEY && process.env.FUB_ORG_ID) {
-    fubClient = fub.createFubClient({
-      apiKey: process.env.FUB_API_KEY,
-      systemName: process.env.FUB_SYSTEM || 'LucentPartners',
-      systemKey: process.env.FUB_SYSTEM_KEY,
-    });
-    fubHandler = fub.createFubWebhookHandler({
-      systemKey: process.env.FUB_SYSTEM_KEY,
-      processWebhook: fub.createFubProcessor({
-        client: fubClient,
-        store: fub.createFubStore(supabase),
-        orgId: process.env.FUB_ORG_ID,
-      }),
-    });
-  }
+  // CRM connections, one per brokerage, keys stored encrypted.
+  const encKey = deriveKey();
+  const box = encKey ? createSecretBox(encKey) : null;
+  if (!box) console.warn('⚠️  CRM connections disabled (set CRM_ENCRYPTION_KEY or API_SECRET_KEY)');
+  const crmStore = createCrmStore(supabase);
+  const crmService = box ? createCrmService({
+    store: crmStore,
+    box,
+    supabase,
+    publicBaseUrl,
+    fubSystem: process.env.FUB_SYSTEM || 'LucentPartners',
+    fubSystemKey: process.env.FUB_SYSTEM_KEY || null,
+    makeBoldTrailClient: createBoldTrailClient,
+  }) : null;
+
+  // Follow Up Boss: instant webhooks at /crm/fub/webhook/<brokerage token>.
+  const fubHandler = crmService && process.env.FUB_SYSTEM_KEY
+    ? fub.createFubWebhookHandler({ resolve: crmService.fubProcessorForToken, systemKey: process.env.FUB_SYSTEM_KEY })
+    : null;
+
+  const adminRouter = crmService
+    ? createAdminRouter({ password: process.env.ADMIN_PASSWORD, store: createAdminStore(supabase), crmService, crmStore })
+    : null;
+  if (!process.env.ADMIN_PASSWORD) console.warn('⚠️  Admin page disabled (ADMIN_PASSWORD not set)');
 
   const app = createApp({
     supabase,
     fubHandler,
+    adminRouter,
     twilioClient,
     twilioFromNumber: process.env.TWILIO_PHONE_NUMBER,
     mailer,
@@ -525,11 +539,13 @@ if (require.main === module) {
     console.log(`📧 Email provider: ${mailer ? 'Resend' : 'disabled'}`);
     console.log(`📱 SMS provider: ${twilioClient ? 'Twilio' : 'disabled'}`);
     console.log(`📞 Tap-to-call: ${callBridge ? 'enabled' : 'disabled'}`);
-    console.log(`🔗 Follow Up Boss: ${fubClient ? 'enabled' : 'disabled'}`);
-    if (fubClient) {
-      fub.ensureWebhooks({ client: fubClient, url: `${publicBaseUrl}${fub.WEBHOOK_PATH}` })
-        .then((created) => console.log(`FUB webhooks ready (${created.length} new)`))
-        .catch((e) => console.error('FUB webhook setup failed:', e.message));
+    console.log(`🔗 Follow Up Boss: ${fubHandler ? 'enabled' : 'disabled'}`);
+    console.log(`🛠️  Admin page: ${adminRouter && process.env.ADMIN_PASSWORD ? 'enabled at /admin' : 'disabled'}`);
+    if (crmService) {
+      crmService.migrateEnvConnection()
+        .then(() => crmService.ensureAllFubWebhooks())
+        .then(() => console.log('FUB webhooks checked'))
+        .catch((e) => console.error('CRM startup failed:', e.message));
     }
   });
 
@@ -549,6 +565,22 @@ if (require.main === module) {
     });
     worker.start(Number(process.env.ENFORCEMENT_INTERVAL_MS) || 30000);
     console.log('🛡️  Enforcement worker running');
+  }
+
+  // BoldTrail call detection (polls each connected brokerage every minute).
+  if (crmService && process.env.BOLDTRAIL_ENABLED !== 'false') {
+    const poller = createBoldTrailPoller({
+      listConnections: async () => (await crmStore.listActive('boldtrail')).flatMap((c) => {
+        try { return [{ id: c.id, org_id: c.org_id, token: box.decrypt(c.api_key_encrypted) }]; } catch (e) {
+          console.error(`BoldTrail key for org ${c.org_id} unreadable:`, e.message);
+          return [];
+        }
+      }),
+      store: fub.createFubStore(supabase),
+      onConnectionError: (conn, e) => crmStore.setStatus(conn.id, /-> 40[13]/.test(e.message) ? 'error' : 'active', e.message),
+    });
+    poller.start(Number(process.env.BOLDTRAIL_INTERVAL_MS) || 60000);
+    console.log('📇 BoldTrail poller running');
   }
 }
 

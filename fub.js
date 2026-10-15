@@ -7,12 +7,11 @@
 // to an open Lucent lead by phone or email, and mark the lead responded
 // (logged as verified, channel fub_call / fub_text / fub_email).
 //
-// Setup (Railway variables):
-//   FUB_API_KEY     API key from the account owner (Admin -> API)
-//   FUB_SYSTEM_KEY  System Key from the FUB system registration
+// Each brokerage connects its own FUB account (see crm.js); its webhooks
+// point to  /crm/fub/webhook/<connection token>  so we know whose it is.
+// Shared across all brokerages (Railway variables):
+//   FUB_SYSTEM_KEY  System Key from Lucent's FUB system registration
 //   FUB_SYSTEM      registered System ID (default: LucentPartners)
-//   FUB_ORG_ID      the Lucent organization this FUB account belongs to
-// On startup the API registers its webhooks in FUB if they're missing.
 // =====================================================
 
 const crypto = require('crypto');
@@ -146,13 +145,26 @@ function createFubClient({ apiKey, systemName, systemKey, fetchImpl = globalThis
     get: (path) => call('GET', path),
     listWebhooks: () => call('GET', '/webhooks?limit=100'),
     createWebhook: (event, url) => call('POST', '/webhooks', { event, url }),
+    deleteWebhook: (id) => call('DELETE', `/webhooks/${id}`),
+    // Confirms the key works; returns the user the key belongs to.
+    me: () => call('GET', '/me'),
   };
 }
 
 // Registers any of our webhooks that aren't already in the FUB account.
-async function ensureWebhooks({ client, url, log = console }) {
+// Also removes our own old webhooks (any other URL under ownPrefix), e.g. the
+// pre-multi-client address, so each activity is delivered once.
+async function ensureWebhooks({ client, url, ownPrefix = null, log = console }) {
   const existing = await client.listWebhooks();
-  const have = new Set((existing.webhooks || []).filter((w) => w.url === url && w.status !== 'Disabled').map((w) => w.event));
+  const hooks = existing.webhooks || [];
+  if (ownPrefix) {
+    for (const w of hooks) {
+      if (w.url !== url && String(w.url || '').startsWith(ownPrefix)) {
+        await client.deleteWebhook(w.id).catch((e) => log.error('FUB old webhook removal failed:', e.message));
+      }
+    }
+  }
+  const have = new Set(hooks.filter((w) => w.url === url && w.status !== 'Disabled').map((w) => w.event));
   const created = [];
   for (const event of Object.keys(EVENTS)) {
     if (have.has(event)) continue;
@@ -251,9 +263,10 @@ function createFubProcessor({ client, store, orgId, log = console, now = () => n
 
 // ---------- webhook route ----------
 
-function createFubWebhookHandler({ processWebhook, systemKey, log = console }) {
+// resolve(token) -> processWebhook for that brokerage's connection, or null.
+function createFubWebhookHandler({ resolve, systemKey, log = console }) {
   const router = express.Router();
-  router.post(WEBHOOK_PATH, express.raw({ type: '*/*', limit: '1mb' }), (req, res) => {
+  const handle = async (req, res) => {
     const raw = req.body instanceof Buffer ? req.body : Buffer.from('');
     if (!verifySignature(raw, req.get('FUB-Signature'), systemKey)) {
       log.error('Rejected FUB webhook with bad signature');
@@ -262,10 +275,18 @@ function createFubWebhookHandler({ processWebhook, systemKey, log = console }) {
     let payload;
     try { payload = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).send('Bad JSON'); }
 
+    let processWebhook;
+    try { processWebhook = await resolve(req.params.token || null); } catch (e) { log.error('FUB connection lookup failed:', e.message); }
+    // Unknown/removed connection: acknowledge so FUB doesn't retry or disable us.
+    if (!processWebhook) return res.status(200).send('ignored');
+
     // FUB needs a 2xx within 10 seconds, so acknowledge first, then work.
     res.status(200).send('ok');
     processWebhook(payload).catch((e) => log.error('FUB webhook processing error:', e.message));
-  });
+  };
+  const raw = express.raw({ type: '*/*', limit: '1mb' });
+  router.post(`${WEBHOOK_PATH}/:token`, raw, handle);
+  router.post(WEBHOOK_PATH, raw, handle); // legacy single-account address
   return router;
 }
 

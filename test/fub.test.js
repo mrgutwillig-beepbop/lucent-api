@@ -174,12 +174,12 @@ function sign(body) {
   return crypto.createHmac('sha256', SYSTEM_KEY).update(Buffer.from(body).toString('base64')).digest('hex');
 }
 
-async function postWebhook(handler, body, signature) {
+async function postWebhook(handler, body, signature, suffix = '') {
   const app = express();
   app.use(handler);
   const server = app.listen(0);
   try {
-    return await fetch(`http://127.0.0.1:${server.address().port}${fub.WEBHOOK_PATH}`, {
+    return await fetch(`http://127.0.0.1:${server.address().port}${fub.WEBHOOK_PATH}${suffix}`, {
       method: 'POST', headers: { 'content-type': 'application/json', 'FUB-Signature': signature }, body,
     });
   } finally { server.close(); }
@@ -187,23 +187,50 @@ async function postWebhook(handler, body, signature) {
 
 test('signed webhook is acknowledged and processed', async () => {
   const received = [];
-  const handler = fub.createFubWebhookHandler({ systemKey: SYSTEM_KEY, log: quiet, processWebhook: async (p) => { received.push(p); return []; } });
+  const tokens = [];
+  const handler = fub.createFubWebhookHandler({ systemKey: SYSTEM_KEY, log: quiet,
+    resolve: async (t) => { tokens.push(t); return async (p) => { received.push(p); return []; }; } });
   const body = JSON.stringify({ event: 'callsCreated', resourceIds: [7] });
-  const res = await postWebhook(handler, body, sign(body));
+  const res = await postWebhook(handler, body, sign(body), '/abc123');
   assert.equal(res.status, 200);
   await new Promise((r) => setTimeout(r, 10));
   assert.deepEqual(received, [{ event: 'callsCreated', resourceIds: [7] }]);
+  assert.deepEqual(tokens, ['abc123']);
+});
+
+test('webhook for an unknown connection is acknowledged but not processed', async () => {
+  const handler = fub.createFubWebhookHandler({ systemKey: SYSTEM_KEY, log: quiet, resolve: async () => null });
+  const body = JSON.stringify({ event: 'callsCreated', resourceIds: [7] });
+  const res = await postWebhook(handler, body, sign(body), '/gone');
+  assert.equal(res.status, 200);
+  assert.equal(await res.text(), 'ignored');
 });
 
 test('webhook with a bad signature is rejected', async () => {
   const received = [];
-  const handler = fub.createFubWebhookHandler({ systemKey: SYSTEM_KEY, log: quiet, processWebhook: async (p) => { received.push(p); } });
+  const handler = fub.createFubWebhookHandler({ systemKey: SYSTEM_KEY, log: quiet, resolve: async () => async (p) => { received.push(p); } });
   const res = await postWebhook(handler, JSON.stringify({ event: 'callsCreated' }), 'deadbeef');
   assert.equal(res.status, 401);
   assert.equal(received.length, 0);
 });
 
 // ---------- webhook registration ----------
+
+test('old Lucent webhook addresses are removed, others left alone', async () => {
+  const url = 'https://lucent.test/crm/fub/webhook/tok';
+  const deleted = [];
+  const client = {
+    listWebhooks: async () => ({ webhooks: [
+      { id: 1, event: 'callsCreated', url: 'https://lucent.test/crm/fub/webhook', status: 'Active' },
+      { id: 2, event: 'callsCreated', url: 'https://other-vendor.test/hook', status: 'Active' },
+      { id: 3, event: 'callsCreated', url, status: 'Active' },
+    ] }),
+    createWebhook: async () => {},
+    deleteWebhook: async (id) => { deleted.push(id); },
+  };
+  await fub.ensureWebhooks({ client, url, ownPrefix: 'https://lucent.test/crm/fub/webhook', log: quiet });
+  assert.deepEqual(deleted, [1]);
+});
 
 test('only missing webhooks are registered', async () => {
   const url = 'https://lucent.test/crm/fub/webhook';
